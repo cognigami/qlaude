@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 import_claude.py — Claude export importer
 
@@ -23,55 +24,6 @@ import re
 import sqlite3
 import sys
 from pathlib import Path
-
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
-
-def main():
-    parser = argparse.ArgumentParser(description="Import Claude export into SQLite")
-    parser.add_argument("export",     help="Path to conversations.json")
-    parser.add_argument("--db",       default="claude.db",    help="SQLite DB path")
-    parser.add_argument("--artifacts", default="./artifacts", help="Artifact output dir")
-    args = parser.parse_args()
-
-    export_path   = Path(args.export)
-    db_path       = Path(args.db)
-    artifacts_root = Path(args.artifacts)
-
-    if not export_path.exists():
-        print(f"Error: {export_path} not found")
-        sys.exit(1)
-
-    print(f"Loading {export_path} …")
-    conversations = load_export(export_path)
-    print(f"Found {len(conversations)} conversations")
-
-    con = sqlite3.connect(db_path)
-    cur = con.cursor()
-    cur.executescript(SCHEMA)
-    con.commit()
-
-    total_msgs      = 0
-    total_artifacts = 0
-
-    for i, conv in enumerate(conversations, 1):
-        name = conv.get("name", "<untitled>")
-        print(f"  [{i:2d}/{len(conversations)}] {name[:60]}")
-        n_msgs, n_art = import_conversation(conv, cur, artifacts_root)
-        total_msgs      += n_msgs
-        total_artifacts += n_art
-        print(f"         {n_msgs} messages, {n_art} artifacts")
-
-    con.commit()
-    con.close()
-
-    print(f"\nDone.")
-    print(f"  Conversations : {len(conversations)}")
-    print(f"  Messages      : {total_msgs}")
-    print(f"  Artifacts     : {total_artifacts}")
-    print(f"  Database      : {db_path.resolve()}")
-    print(f"  Artifacts dir : {artifacts_root.resolve()}")
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────
@@ -301,12 +253,18 @@ def load_export(path: Path):
 
 
 def has_content(conv) -> bool:
-    """Return True if at least one message has non-empty text or content blocks."""
+    """Return True if at least one message has substantive content."""
     for msg in conv.get("chat_messages") or conv.get("messages") or []:
         if (msg.get("text") or "").strip():
             return True
-        if msg.get("content"):
-            return True
+        for block in msg.get("content") or []:
+            # text/thinking blocks must have non-empty text
+            if block.get("type") in ("text", "thinking"):
+                if (block.get("text") or block.get("thinking") or "").strip():
+                    return True
+            # tool_use/tool_result blocks count as content regardless
+            elif block.get("type") in ("tool_use", "tool_result"):
+                return True
     return False
 
 
@@ -323,6 +281,22 @@ def import_conversation(conv, cur, artifacts_root: Path):
     if not has_content(conv):
         return 0, 0
 
+    conv_updated_at = conv.get("updated_at", "")
+
+    # Check if this conversation is already in the DB and unchanged.
+    # If updated_at matches, skip the expensive rebuild and return existing counts.
+    existing = cur.execute(
+        "SELECT updated_at FROM conversations WHERE uuid = ?", (conv_uuid,)
+    ).fetchone()
+    if existing and existing["updated_at"] == conv_updated_at:
+        n_msgs = cur.execute(
+            "SELECT COUNT(*) FROM messages WHERE conversation_uuid = ?", (conv_uuid,)
+        ).fetchone()[0]
+        n_art = cur.execute(
+            "SELECT COUNT(*) FROM artifacts WHERE conversation_uuid = ?", (conv_uuid,)
+        ).fetchone()[0]
+        return n_msgs, n_art
+
     # -- conversations table --
     cur.execute("""
         INSERT OR REPLACE INTO conversations
@@ -334,7 +308,7 @@ def import_conversation(conv, cur, artifacts_root: Path):
         conv.get("summary"),
         (conv.get("account") or {}).get("uuid"),
         conv.get("created_at"),
-        conv.get("updated_at"),
+        conv_updated_at,
     ))
 
     # Sort messages by created_at so str_replace patches apply in order
@@ -486,6 +460,82 @@ def import_conversation(conv, cur, artifacts_root: Path):
         ))
 
     return len(messages), artifact_count
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Import Claude export into SQLite")
+    parser.add_argument("export",     help="Path to conversations.json")
+    parser.add_argument("--db",       default="claude.db",    help="SQLite DB path")
+    parser.add_argument("--artifacts", default="./artifacts", help="Artifact output dir")
+    args = parser.parse_args()
+
+    export_path   = Path(args.export)
+    db_path       = Path(args.db)
+    artifacts_root = Path(args.artifacts)
+
+    if not export_path.exists():
+        print(f"Error: {export_path} not found")
+        sys.exit(1)
+
+    print(f"Loading {export_path} …")
+    conversations = load_export(export_path)
+    print(f"Found {len(conversations)} conversations")
+
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+    cur.executescript(SCHEMA)
+    con.commit()
+
+    total_msgs      = 0
+    total_artifacts = 0
+    n_new           = 0
+    n_updated       = 0
+    n_unchanged     = 0
+    n_skipped       = 0
+
+    for i, conv in enumerate(conversations, 1):
+        name        = conv.get("name", "<untitled>")
+        conv_uuid   = conv["uuid"]
+        updated_at  = conv.get("updated_at", "")
+
+        if not has_content(conv):
+            n_skipped += 1
+            continue
+
+        existing = cur.execute(
+            "SELECT updated_at FROM conversations WHERE uuid = ?", (conv_uuid,)
+        ).fetchone()
+
+        if existing is None:
+            status = "new"
+            n_new += 1
+        elif existing["updated_at"] != updated_at:
+            status = "updated"
+            n_updated += 1
+        else:
+            status = "unchanged"
+            n_unchanged += 1
+
+        print(f"  [{i:2d}/{len(conversations)}] {name[:55]:<55} {status}")
+        n_msgs, n_art = import_conversation(conv, cur, artifacts_root)
+        total_msgs      += n_msgs
+        total_artifacts += n_art
+        if status != "unchanged":
+            print(f"         {n_msgs} messages, {n_art} artifacts")
+
+    con.commit()
+    con.close()
+
+    print(f"\nDone.")
+    print(f"  Conversations : {len(conversations)}  "
+          f"({n_new} new, {n_updated} updated, {n_unchanged} unchanged, {n_skipped} skipped)")
+    print(f"  Messages      : {total_msgs}")
+    print(f"  Artifacts     : {total_artifacts}")
+    print(f"  Database      : {db_path.resolve()}")
+    print(f"  Artifacts dir : {artifacts_root.resolve()}")
 
 
 if __name__ == "__main__":
